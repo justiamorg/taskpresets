@@ -1,0 +1,35 @@
+{
+  "schema_version": "1",
+  "presets": [
+    {
+      "id": "datadog-teams-sync",
+      "name": "Datadog Teams Sync",
+      "description": "Reads JustIAM app mappings (variable_name=teams) as the source of truth, creates/deletes matching Datadog teams, and keeps SAML authn_mappings in sync so team membership is propagated via SAML assertion.",
+      "tags": [
+        "datadog",
+        "teams",
+        "saml",
+        "sync"
+      ],
+      "versions": [
+        "v1.0.0"
+      ],
+      "latest": "v1.0.0"
+    },
+    {
+      "id": "datadog-roles-sync",
+      "name": "Datadog Roles Sync",
+      "description": "Reads JustIAM app mappings (variable_name=roles) as the source of truth and keeps Datadog SAML role authn_mappings in sync. Managed roles (Datadog built-ins) are never created or deleted.",
+      "tags": [
+        "datadog",
+        "roles",
+        "saml",
+        "sync"
+      ],
+      "versions": [
+        "v1.0.0"
+      ],
+      "latest": "v1.0.0"
+    }
+  ]
+}
