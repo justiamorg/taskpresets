@@ -16,6 +16,7 @@ schedule:
   type: cron
   default_cron: "0 * * * *"
   timeout_secs: 120
+  overlap_policy: queue
 
 config:
   - key: dd_endpoint
