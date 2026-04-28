@@ -10,13 +10,16 @@ on:
   # Allow manual re-signing (e.g. after rotating the key)
   workflow_dispatch:
 
-permissions:
-  contents: write
-
+# Skip if the commit was made by this workflow itself (contains [skip ci])
+# or if the pusher is the actions bot.
 jobs:
   sign:
     name: Compute checksums and sign
     runs-on: ubuntu-latest
+    if: "!contains(github.event.head_commit.message, '[skip ci]')"
+
+    permissions:
+      contents: write
 
     steps:
       - name: Checkout
