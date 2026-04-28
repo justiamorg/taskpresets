@@ -1,0 +1,525 @@
+schema_version: "1"
+id: datadog-teams-sync
+version: v0.0.3
+name: Datadog Teams Sync
+description: >-
+  Reads JustIAM app mappings (variable_name=teams) as the source of truth,
+  creates/deletes matching Datadog teams, and keeps SAML authn_mappings in
+  sync so team membership is propagated via SAML assertion.
+tags:
+  - datadog
+  - teams
+  - saml
+  - sync
+
+schedule:
+  type: cron
+  default_cron: "0 * * * *"
+  timeout_secs: 120
+  overlap_policy: queue
+
+config:
+  - key: dd_endpoint
+    label: "Datadog Endpoint"
+    description: "Datadog API base URL (e.g. https://api.datadoghq.eu)"
+    type: text
+    required: true
+  - key: justiam_app_id
+    label: "Application"
+    description: "JustIAM application whose app mappings to sync (teams variable)"
+    type: application_id
+    required: true
+  - key: variable_name
+    label: "Variable Name"
+    description: "App mapping variable name containing team handles"
+    type: text
+    default: "teams"
+    required: true
+
+secrets:
+  - key: dd_api_key
+    label: "DD API Key"
+    description: "Datadog API key (DD-API-KEY header)"
+    required: true
+  - key: dd_app_key
+    label: "DD Application Key"
+    description: "Datadog application key (DD-APPLICATION-KEY header)"
+    required: true
+
+script: |
+  package task
+
+  import (
+    "bytes"
+    "encoding/json"
+    "errors"
+    "fmt"
+    "io"
+    "log"
+    "net/http"
+    "strings"
+
+    "config"
+    "idp"
+    "secrets"
+  )
+
+  // ── Datadog types ──────────────────────────────────────────────────────────
+
+  type ddTeamAttrs struct {
+    Handle string `json:"handle"`
+    Name   string `json:"name"`
+  }
+
+  type ddTeam struct {
+    ID         string      `json:"id"`
+    Attributes ddTeamAttrs `json:"attributes"`
+  }
+
+  // Datadog Teams API v2: /api/v2/team uses page[number]+page[size].
+  // Response: meta.pagination.total. Stop when len(page.Data) < pageSize.
+  // Named nested types required — Yaegi does not support anonymous struct field access.
+  type ddPagination struct {
+    Total int `json:"total"`
+  }
+
+  type ddMeta struct {
+    Pagination ddPagination `json:"pagination"`
+  }
+
+  type ddTeamsPage struct {
+    Data []ddTeam `json:"data"`
+    Meta ddMeta   `json:"meta"`
+  }
+
+  type ddCreateResponse struct {
+    Data ddTeam `json:"data"`
+  }
+
+  // ── Datadog AuthN Mapping types (SAML → team assignments) ─────────────────
+  // API: GET/POST /api/v2/authn_mappings, DELETE /api/v2/authn_mappings/{id}
+  // One mapping per team: attribute_key + attribute_value → team id.
+  // All nested types are named — Yaegi cannot access anonymous struct fields.
+
+  type ddAuthNAttrs struct {
+    AttributeKey   string `json:"attribute_key"`
+    AttributeValue string `json:"attribute_value"`
+  }
+
+  type ddAuthNTeamData struct {
+    ID string `json:"id"`
+  }
+
+  type ddAuthNTeamRel struct {
+    Data ddAuthNTeamData `json:"data"`
+  }
+
+  type ddAuthNRels struct {
+    Team ddAuthNTeamRel `json:"team"`
+  }
+
+  type ddAuthNMapping struct {
+    ID            string       `json:"id"`
+    Attributes    ddAuthNAttrs `json:"attributes"`
+    Relationships ddAuthNRels  `json:"relationships"`
+  }
+
+  type ddAuthNPageCounts struct {
+    TotalFilteredCount int `json:"total_filtered_count"`
+  }
+
+  type ddAuthNPageMeta struct {
+    Page ddAuthNPageCounts `json:"page"`
+  }
+
+  type ddAuthNPage struct {
+    Data []ddAuthNMapping `json:"data"`
+    Meta ddAuthNPageMeta  `json:"meta"`
+  }
+
+  type ddAuthNCreateResp struct {
+    Data ddAuthNMapping `json:"data"`
+  }
+
+  // ── Datadog HTTP helper ────────────────────────────────────────────────────
+
+  func ddDo(method, url, apiKey, appKey string, body []byte) ([]byte, int, error) {
+    var br io.Reader
+    if len(body) > 0 {
+      br = bytes.NewReader(body)
+    }
+    req, err := http.NewRequest(method, url, br)
+    if err != nil {
+      return nil, 0, err
+    }
+    req.Header.Set("DD-API-KEY", apiKey)
+    req.Header.Set("DD-APPLICATION-KEY", appKey)
+    req.Header.Set("Accept", "application/json")
+    if len(body) > 0 {
+      req.Header.Set("Content-Type", "application/json")
+    }
+    resp, err := http.DefaultClient.Do(req)
+    if err != nil {
+      return nil, 0, err
+    }
+    raw, _ := io.ReadAll(resp.Body)
+    resp.Body.Close()
+    return raw, resp.StatusCode, nil
+  }
+
+  // ── Datadog: fetch all teams (paginated) ───────────────────────────────────
+
+  // fetchDDTeams returns all teams keyed by lowercase handle.
+  // Uses /api/v2/team (singular) — the real Teams product visible in the Datadog UI.
+  // Pagination: page[number] (0-based) + page[size]. Stops when fewer items than page size.
+  func fetchDDTeams(ddEndpoint, apiKey, appKey string) (map[string]ddTeam, error) {
+    all := make(map[string]ddTeam) // lowercase handle → team
+    pageNum := 0
+    pageSize := 100
+    for {
+      reqURL := fmt.Sprintf("%s/api/v2/team?page[number]=%d&page[size]=%d",
+        ddEndpoint, pageNum, pageSize)
+      raw, status, err := ddDo("GET", reqURL, apiKey, appKey, nil)
+      if err != nil {
+        return nil, fmt.Errorf("GET /api/v2/team: %w", err)
+      }
+      if status >= 300 {
+        return nil, fmt.Errorf("GET /api/v2/team HTTP %d: %s", status, strings.TrimSpace(string(raw)))
+      }
+      log.Printf("  dd fetch (page=%d): %s", pageNum, strings.TrimSpace(string(raw)))
+      var page ddTeamsPage
+      if err := json.Unmarshal(raw, &page); err != nil {
+        return nil, fmt.Errorf("decode teams response: %w (body: %s)", err, string(raw))
+      }
+      log.Printf("  dd page %d: returned=%d total=%d", pageNum, len(page.Data), page.Meta.Pagination.Total)
+      for _, t := range page.Data {
+        if t.ID == "" || t.Attributes.Handle == "" {
+          log.Printf("    dd team skipped (empty id or handle): id=%q handle=%q", t.ID, t.Attributes.Handle)
+          continue
+        }
+        key := strings.ToLower(t.Attributes.Handle)
+        all[key] = t
+        log.Printf("    dd team: handle=%q name=%q id=%s", t.Attributes.Handle, t.Attributes.Name, t.ID)
+      }
+      if len(page.Data) < pageSize {
+        break
+      }
+      pageNum++
+    }
+    return all, nil
+  }
+
+  // ── Datadog: create a team ─────────────────────────────────────────────────
+  // Returns (newID, alreadyExisted, error).
+
+  func createDDTeam(ddEndpoint, apiKey, appKey, handle, name string) (string, bool, error) {
+    body, err := json.Marshal(map[string]interface{}{
+      "data": map[string]interface{}{
+        "type": "team",
+        "attributes": map[string]string{
+          "handle": strings.ToLower(handle),
+          "name":   name,
+        },
+      },
+    })
+    if err != nil {
+      return "", false, err
+    }
+    raw, status, err := ddDo("POST", ddEndpoint+"/api/v2/team", apiKey, appKey, body)
+    if err != nil {
+      return "", false, err
+    }
+    log.Printf("    dd create response HTTP %d: %s", status, strings.TrimSpace(string(raw)))
+    // 400 "already exists" — treat as already in sync.
+    if status == 400 && strings.Contains(string(raw), "already exists") {
+      return "", true, nil
+    }
+    if status >= 300 {
+      return "", false, fmt.Errorf("POST /api/v2/team HTTP %d: %s", status, strings.TrimSpace(string(raw)))
+    }
+    var created ddCreateResponse
+    if err := json.Unmarshal(raw, &created); err != nil {
+      return "", false, fmt.Errorf("decode create response: %w (body: %s)", err, string(raw))
+    }
+    return created.Data.ID, false, nil
+  }
+
+  // ── Datadog: delete a team ─────────────────────────────────────────────────
+
+  func deleteDDTeam(ddEndpoint, apiKey, appKey, teamID string) error {
+    url := fmt.Sprintf("%s/api/v2/team/%s", ddEndpoint, teamID)
+    raw, status, err := ddDo("DELETE", url, apiKey, appKey, nil)
+    if err != nil {
+      return err
+    }
+    log.Printf("    dd delete response HTTP %d: %s", status, strings.TrimSpace(string(raw)))
+    if status >= 300 {
+      return fmt.Errorf("DELETE /api/v2/team/%s HTTP %d: %s", teamID, status, strings.TrimSpace(string(raw)))
+    }
+    return nil
+  }
+
+  // ── Datadog: fetch all SAML team authn mappings ────────────────────────────
+
+  // fetchDDAuthNMappings returns all SAML team authn mappings keyed by lowercase
+  // attribute_value. Filters server-side by resource_type=team and client-side
+  // by attrKey so unrelated mappings (different attribute keys) are never touched.
+  func fetchDDAuthNMappings(ddEndpoint, apiKey, appKey, attrKey string) (map[string]ddAuthNMapping, error) {
+    all := make(map[string]ddAuthNMapping)
+    reqURL := fmt.Sprintf("%s/api/v2/authn_mappings?resource_type=team&page[size]=500", ddEndpoint)
+    raw, status, err := ddDo("GET", reqURL, apiKey, appKey, nil)
+    if err != nil {
+      return nil, fmt.Errorf("GET /api/v2/authn_mappings: %w", err)
+    }
+    if status >= 300 {
+      return nil, fmt.Errorf("GET /api/v2/authn_mappings HTTP %d: %s", status, strings.TrimSpace(string(raw)))
+    }
+    var page ddAuthNPage
+    if err := json.Unmarshal(raw, &page); err != nil {
+      return nil, fmt.Errorf("decode authn_mappings response: %w (body: %s)", err, string(raw))
+    }
+    log.Printf("  dd authn_mappings: total_filtered=%d", page.Meta.Page.TotalFilteredCount)
+    for _, m := range page.Data {
+      if m.ID == "" || m.Attributes.AttributeValue == "" {
+        continue
+      }
+      if m.Attributes.AttributeKey != attrKey {
+        continue // leave unrelated attribute keys untouched
+      }
+      key := strings.ToLower(m.Attributes.AttributeValue)
+      all[key] = m
+      log.Printf("    dd authn_mapping: value=%q id=%s team_id=%s",
+        m.Attributes.AttributeValue, m.ID, m.Relationships.Team.Data.ID)
+    }
+    return all, nil
+  }
+
+  // createDDAuthNMapping creates a SAML → team authn mapping and returns the new mapping ID.
+  func createDDAuthNMapping(ddEndpoint, apiKey, appKey, attrKey, attrValue, teamID string) (string, error) {
+    body, err := json.Marshal(map[string]interface{}{
+      "data": map[string]interface{}{
+        "type": "authn_mappings",
+        "attributes": map[string]string{
+          "attribute_key":   attrKey,
+          "attribute_value": attrValue,
+        },
+        "relationships": map[string]interface{}{
+          "team": map[string]interface{}{
+            "data": map[string]string{
+              "id":   teamID,
+              "type": "team",
+            },
+          },
+        },
+      },
+    })
+    if err != nil {
+      return "", err
+    }
+    raw, status, err := ddDo("POST", ddEndpoint+"/api/v2/authn_mappings", apiKey, appKey, body)
+    if err != nil {
+      return "", err
+    }
+    log.Printf("    dd authn create HTTP %d: %s", status, strings.TrimSpace(string(raw)))
+    if status >= 300 {
+      return "", fmt.Errorf("POST /api/v2/authn_mappings HTTP %d: %s", status, strings.TrimSpace(string(raw)))
+    }
+    var created ddAuthNCreateResp
+    if err := json.Unmarshal(raw, &created); err != nil {
+      return "", fmt.Errorf("decode authn create response: %w (body: %s)", err, string(raw))
+    }
+    return created.Data.ID, nil
+  }
+
+  // deleteDDAuthNMapping deletes a SAML team authn mapping. DELETE returns 204 (empty body).
+  func deleteDDAuthNMapping(ddEndpoint, apiKey, appKey, mappingID string) error {
+    url := fmt.Sprintf("%s/api/v2/authn_mappings/%s", ddEndpoint, mappingID)
+    raw, status, err := ddDo("DELETE", url, apiKey, appKey, nil)
+    if err != nil {
+      return err
+    }
+    if status >= 300 {
+      return fmt.Errorf("DELETE /api/v2/authn_mappings/%s HTTP %d: %s", mappingID, status, strings.TrimSpace(string(raw)))
+    }
+    return nil
+  }
+
+  // ── Entry point ────────────────────────────────────────────────────────────
+
+  func Run() (string, error) {
+    ddEndpoint := strings.TrimRight(config.Get("dd_endpoint"), "/")
+    appID      := config.Get("justiam_app_id")
+    varName    := config.Get("variable_name")
+    ddAPIKey   := secrets.Get("dd_api_key")
+    ddAppKey   := secrets.Get("dd_app_key")
+
+    // Validate all required config/secrets up front.
+    var missing []string
+    if ddEndpoint == "" { missing = append(missing, "config:dd_endpoint") }
+    if appID == ""      { missing = append(missing, "config:justiam_app_id") }
+    if varName == ""    { missing = append(missing, "config:variable_name") }
+    if ddAPIKey == ""   { missing = append(missing, "secret:dd_api_key") }
+    if ddAppKey == ""   { missing = append(missing, "secret:dd_app_key") }
+    if len(missing) > 0 {
+      return "", fmt.Errorf("missing required values: %s", strings.Join(missing, ", "))
+    }
+
+    log.Printf("config: dd_endpoint=%s justiam_app_id=%s variable_name=%s", ddEndpoint, appID, varName)
+
+    // 1. Read JustIAM app mappings — source of truth.
+    allMappings, err := idp.ListAppMappingsByApp(appID)
+    if err != nil {
+      return "", fmt.Errorf("list app mappings for app %s: %w", appID, err)
+    }
+    if len(allMappings) == 0 {
+      return "", errors.New("no app mappings found for this application — check that justiam_app_id is correct")
+    }
+
+    // Collect all variable names present, for diagnostic messaging.
+    varNames := make(map[string]bool)
+    for _, m := range allMappings {
+      varNames[m.VariableName] = true
+    }
+    log.Printf("justiam: app_id=%s has %d total mappings across variables: %s",
+      appID, len(allMappings), joinKeys(varNames))
+
+    type jiMapping struct {
+      id    string
+      value string
+    }
+    var jiMappings []jiMapping
+    for _, m := range allMappings {
+      if m.VariableName == varName {
+        jiMappings = append(jiMappings, jiMapping{id: m.ID, value: m.Value})
+      }
+    }
+    if len(jiMappings) == 0 {
+      return "", fmt.Errorf("variable_name %q not found — available variable names: %s",
+        varName, joinKeys(varNames))
+    }
+    log.Printf("justiam: variable_name=%q → %d mappings:", varName, len(jiMappings))
+    for _, m := range jiMappings {
+      log.Printf("  mapping id=%s value=%q", m.id, m.value)
+    }
+
+    // 2. Fetch current Datadog teams.
+    log.Printf("fetching Datadog teams from %s ...", ddEndpoint)
+    ddTeams, err := fetchDDTeams(ddEndpoint, ddAPIKey, ddAppKey)
+    if err != nil {
+      return "", fmt.Errorf("fetch DD teams: %w", err)
+    }
+    log.Printf("datadog: %d teams found total", len(ddTeams))
+    ddTeamsBefore := len(ddTeams)
+
+    // desired set keyed by lowercase handle (matching ddTeams).
+    desired := make(map[string]bool, len(jiMappings))
+    for _, m := range jiMappings {
+      desired[strings.ToLower(m.value)] = true
+    }
+
+    // 3. Create Datadog teams present in JustIAM but missing in Datadog.
+    var createdList []string
+    var skippedList []string
+    for _, m := range jiMappings {
+      handleKey := strings.ToLower(m.value)
+      if _, exists := ddTeams[handleKey]; !exists {
+        log.Printf("creating DD team handle=%q ...", m.value)
+        newID, alreadyExists, err := createDDTeam(ddEndpoint, ddAPIKey, ddAppKey, m.value, m.value)
+        if err != nil {
+          return "", fmt.Errorf("create DD team %q: %w", m.value, err)
+        }
+        if alreadyExists {
+          log.Printf("  → already exists in Datadog (fetch may have missed it) — skipping")
+          skippedList = append(skippedList, m.value)
+        } else {
+          log.Printf("  → created id=%s", newID)
+          createdList = append(createdList, m.value)
+        }
+      } else {
+        log.Printf("DD team handle=%q (id=%s) already in sync — skipping", m.value, ddTeams[handleKey].ID)
+        skippedList = append(skippedList, m.value)
+      }
+    }
+
+    // 4. Delete Datadog teams no longer in JustIAM.
+    var deletedList []string
+    for handle, t := range ddTeams {
+      if !desired[handle] {
+        log.Printf("deleting stale DD team handle=%q id=%s ...", handle, t.ID)
+        if err := deleteDDTeam(ddEndpoint, ddAPIKey, ddAppKey, t.ID); err != nil {
+          return "", fmt.Errorf("delete DD team %q (id=%s): %w", handle, t.ID, err)
+        }
+        log.Printf("  → deleted")
+        deletedList = append(deletedList, handle)
+      }
+    }
+
+    // 5. Re-fetch teams so newly created ones have their IDs available for SAML mapping.
+    log.Printf("re-fetching Datadog teams after team sync ...")
+    ddTeams, err = fetchDDTeams(ddEndpoint, ddAPIKey, ddAppKey)
+    if err != nil {
+      return "", fmt.Errorf("re-fetch DD teams: %w", err)
+    }
+
+    // 6. Sync SAML team authn mappings.
+    // Desired: one mapping per JustIAM team — attribute_key=samlAttrKey, attribute_value=handle.
+    // Only mappings with this exact attribute_key are managed; others are left untouched.
+    samlAttrKey := "http://schemas.xmlsoap.org/claims/Teams"
+    log.Printf("fetching Datadog SAML team authn_mappings (attr_key=%s) ...", samlAttrKey)
+    samlMappings, err := fetchDDAuthNMappings(ddEndpoint, ddAPIKey, ddAppKey, samlAttrKey)
+    if err != nil {
+      return "", fmt.Errorf("fetch DD authn mappings: %w", err)
+    }
+    log.Printf("datadog: %d SAML team mappings found before sync", len(samlMappings))
+
+    var samlCreatedList []string
+    var samlSkippedList []string
+    for _, m := range jiMappings {
+      handleKey := strings.ToLower(m.value)
+      t, ok := ddTeams[handleKey]
+      if !ok {
+        log.Printf("SAML mapping: no DD team for handle=%q — skipping", m.value)
+        continue
+      }
+      if _, exists := samlMappings[handleKey]; !exists {
+        log.Printf("creating SAML mapping: value=%q → team id=%s", m.value, t.ID)
+        newID, err := createDDAuthNMapping(ddEndpoint, ddAPIKey, ddAppKey, samlAttrKey, m.value, t.ID)
+        if err != nil {
+          return "", fmt.Errorf("create SAML mapping for team %q: %w", m.value, err)
+        }
+        log.Printf("  → created id=%s", newID)
+        samlCreatedList = append(samlCreatedList, m.value)
+      } else {
+        log.Printf("SAML mapping %q already in sync — skipping", m.value)
+        samlSkippedList = append(samlSkippedList, m.value)
+      }
+    }
+
+    // Delete SAML mappings for teams no longer in JustIAM.
+    var samlDeletedList []string
+    for attrVal, sm := range samlMappings {
+      if !desired[attrVal] {
+        log.Printf("deleting stale SAML mapping: value=%q id=%s", attrVal, sm.ID)
+        if err := deleteDDAuthNMapping(ddEndpoint, ddAPIKey, ddAppKey, sm.ID); err != nil {
+          return "", fmt.Errorf("delete SAML mapping %q (id=%s): %w", attrVal, sm.ID, err)
+        }
+        log.Printf("  → deleted")
+        samlDeletedList = append(samlDeletedList, attrVal)
+      }
+    }
+
+    return fmt.Sprintf(
+      "sync complete: teams[justiam=%d dd_before=%d created=%d skipped=%d deleted=%d] saml[before=%d created=%d skipped=%d deleted=%d]",
+      len(jiMappings), ddTeamsBefore, len(createdList), len(skippedList), len(deletedList),
+      len(samlMappings), len(samlCreatedList), len(samlSkippedList), len(samlDeletedList),
+    ), nil
+  }
+
+  func joinKeys(m map[string]bool) string {
+    keys := make([]string, 0, len(m))
+    for k := range m {
+      keys = append(keys, k)
+    }
+    return "[" + strings.Join(keys, ", ") + "]"
+  }
+
