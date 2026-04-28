@@ -1,0 +1,3 @@
+26955e05cd158f81300211859ac9936ab09cbee6e3fed5296a193b94debed12a  catalog.json
+0cbf5e2e67a8c413280c03934346220ab164276bb44902713438b80806caf1cd  presets/datadog-roles-sync/v1.0.0.yaml
+26fbdd275e63349bee3210dacdb1f88acb4e1cd625469285c681d23d6310faa6  presets/datadog-teams-sync/v1.0.0.yaml

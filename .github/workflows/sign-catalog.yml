@@ -1,0 +1,65 @@
+name: Sign catalog
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'catalog.json'
+      - 'presets/**'
+
+  # Allow manual re-signing (e.g. after rotating the key)
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sign:
+    name: Compute checksums and sign
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Use a deploy key or PAT so the resulting commit triggers downstream workflows
+          token: ${{ secrets.CATALOG_SIGN_TOKEN || github.token }}
+
+      - name: Install minisign
+        run: |
+          curl -sSL https://github.com/jedisct1/minisign/releases/download/0.12/minisign-0.12-linux.tar.gz \
+            | tar xz --strip-components=2 -C /usr/local/bin minisign-linux/x86_64/minisign
+          minisign -v
+
+      - name: Compute checksums
+        run: |
+          # Hash catalog.json and every preset manifest; paths relative to repo root
+          find . -name 'catalog.json' -o -name '*.yaml' \
+            | sort \
+            | xargs sha256sum \
+            | sed 's|\./||' \
+            > checksums.txt
+          echo "=== checksums.txt ==="
+          cat checksums.txt
+
+      - name: Sign checksums
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+        run: |
+          # Write the secret key to a temp file (no password, -W flag)
+          echo "$MINISIGN_SECRET_KEY" > /tmp/catalog.key
+          chmod 600 /tmp/catalog.key
+          minisign -S -s /tmp/catalog.key -m checksums.txt -W
+          rm -f /tmp/catalog.key
+          echo "=== checksums.txt.minisig ==="
+          cat checksums.txt.minisig
+
+      - name: Commit and push
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add checksums.txt checksums.txt.minisig
+          # Only commit if something changed
+          git diff --cached --quiet && echo "Nothing to commit" && exit 0
+          git commit -m "chore: update signed checksums [skip ci]"
+          git push
