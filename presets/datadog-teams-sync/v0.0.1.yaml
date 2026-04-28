@@ -1,6 +1,6 @@
 schema_version: "1"
 id: datadog-teams-sync
-version: v1.0.0
+version: v0.0.1
 name: Datadog Teams Sync
 description: >-
   Reads JustIAM app mappings (variable_name=teams) as the source of truth,

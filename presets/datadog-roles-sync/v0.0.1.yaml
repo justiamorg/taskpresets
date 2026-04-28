@@ -1,6 +1,6 @@
 schema_version: "1"
 id: datadog-roles-sync
-version: v1.0.0
+version: v0.0.1
 name: Datadog Roles Sync
 description: >-
   Reads JustIAM app mappings (variable_name=roles) as the source of truth
