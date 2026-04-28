@@ -1,7 +1,5 @@
-fd5d41e97ef3204e2cacc7656e1bcfe489f8c4048dd5b6bf8664dbd6fa5c16e9  catalog.json
+5ddcdb3888cd436137faafe5cc77fff6e5f0aa98627e42f12d3e12f87ec7bc22  catalog.json
 8755ff0fedd5d86a7bb96aa05754a7a6b460c64219b91db197f199e6ba3b173c  presets/datadog-roles-sync/v0.0.1.yaml
 042a3ae1372423bb32a26ea4e4a8fc2717d6959a48cc7ce7c969920722e071e0  presets/datadog-roles-sync/v0.0.2.yaml
-2f10f282c05302cf95a8e1478dd05f8bbb55296321976ae59614ed7f1c0a239b  presets/datadog-roles-sync/v0.0.3.yaml
 6bec6886d3fff9fc9488b1ba855198987d8ec1ff3142f18564feff3272bd7282  presets/datadog-teams-sync/v0.0.1.yaml
 d2f6a02b25082264ab6c2d163df9c7c337674ba5d20089319ab12db7acdd276d  presets/datadog-teams-sync/v0.0.2.yaml
-abf6a334bfcd9021ed5b24f48d1a01026b05ed2cc55bee43df0a7337032c0958  presets/datadog-teams-sync/v0.0.3.yaml
