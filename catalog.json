@@ -12,9 +12,10 @@
         "sync"
       ],
       "versions": [
-        "v0.0.1"
+        "v0.0.1",
+        "v0.0.2"
       ],
-      "latest": "v0.0.1"
+      "latest": "v0.0.2"
     },
     {
       "id": "datadog-roles-sync",
@@ -27,9 +28,10 @@
         "sync"
       ],
       "versions": [
-        "v0.0.1"
+        "v0.0.1",
+        "v0.0.2"
       ],
-      "latest": "v0.0.1"
+      "latest": "v0.0.2"
     }
   ]
 }
