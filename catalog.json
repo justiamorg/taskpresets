@@ -2,6 +2,21 @@
   "schema_version": "1",
   "presets": [
     {
+      "id": "sftpgo-sync",
+      "name": "SFTPGo Sync",
+      "description": "Reads JustIAM group app mappings as the source of truth and keeps SFTPGo groups, users, and group memberships in sync — emulating OIDC group claim propagation for SFTPGo which cannot read groups from JWT claims.",
+      "tags": [
+        "sftpgo",
+        "users",
+        "groups",
+        "sync"
+      ],
+      "versions": [
+        "v1.0.0"
+      ],
+      "latest": "v1.0.0"
+    },
+    {
       "id": "datadog-teams-sync",
       "name": "Datadog Teams Sync",
       "description": "Reads JustIAM app mappings (variable_name=teams) as the source of truth, creates/deletes matching Datadog teams, and keeps SAML authn_mappings in sync so team membership is propagated via SAML assertion.",

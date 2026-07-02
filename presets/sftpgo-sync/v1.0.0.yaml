@@ -1,0 +1,715 @@
+schema_version: "1"
+id: sftpgo-sync
+version: v1.0.0
+name: SFTPGo Sync
+description: >-
+  Reads JustIAM group app mappings as the source of truth and keeps SFTPGo
+  groups, users, and group memberships in sync. Groups are created/deleted to
+  match JustIAM app mappings; users are pre-provisioned for OIDC login; and
+  group membership mirrors JustIAM group membership — emulating JWT group claim
+  propagation for SFTPGo which cannot read groups from OIDC token claims.
+tags:
+  - sftpgo
+  - users
+  - groups
+  - sync
+
+schedule:
+  type: cron
+  default_cron: "0 * * * *"
+  timeout_secs: 120
+  overlap_policy: queue
+
+config:
+  - key: sftpgo_endpoint
+    label: "SFTPGo Endpoint"
+    description: "SFTPGo API base URL (e.g. https://sftp.example.com)"
+    type: text
+    required: true
+  - key: justiam_app_id
+    label: "Application"
+    description: "JustIAM application whose group app mappings define SFTPGo groups"
+    type: application_id
+    required: true
+  - key: variable_name
+    label: "Variable Name"
+    description: "App mapping variable name containing SFTPGo group names"
+    type: text
+    default: "groups"
+    required: true
+  - key: admin_role_variable_name
+    label: "Admin Role Variable Name"
+    description: "App mapping variable name that identifies admin users (leave empty to disable admin sync)"
+    type: text
+    default: "role"
+    required: false
+  - key: admin_role_value
+    label: "Admin Role Value"
+    description: "App mapping value that marks a group's members as SFTPGo admins"
+    type: text
+    default: "Administrator"
+    required: false
+
+secrets:
+  - key: sftpgo_api_key
+    label: "SFTPGo API Key"
+    description: "SFTPGo admin API key (X-SFTPGO-API-KEY header)"
+    required: true
+
+script: |
+  package task
+
+  import (
+    "bytes"
+    "encoding/json"
+    "fmt"
+    "io"
+    "log"
+    "math/rand"
+    "net/http"
+    "net/url"
+    "strings"
+
+    "config"
+    "idp"
+    "secrets"
+  )
+
+  // ── SFTPGo types ───────────────────────────────────────────────────────────
+
+  const justIAMDescription = "Created with JustIAM Automation"
+
+  type sftpGroup struct {
+    Name string `json:"name"`
+  }
+
+  type sftpAdminEntry struct {
+    Username    string `json:"username"`
+    Description string `json:"description"`
+  }
+
+  // ── SFTPGo HTTP helper ─────────────────────────────────────────────────────
+
+  func sftpDo(method, reqURL, apiKey string, body []byte) ([]byte, int, error) {
+    var br io.Reader
+    if len(body) > 0 {
+      br = bytes.NewReader(body)
+    }
+    req, err := http.NewRequest(method, reqURL, br)
+    if err != nil {
+      return nil, 0, err
+    }
+    req.Header.Set("X-SFTPGO-API-KEY", apiKey)
+    req.Header.Set("Accept", "application/json")
+    if len(body) > 0 {
+      req.Header.Set("Content-Type", "application/json")
+    }
+    resp, err := http.DefaultClient.Do(req)
+    if err != nil {
+      return nil, 0, err
+    }
+    raw, _ := io.ReadAll(resp.Body)
+    resp.Body.Close()
+    return raw, resp.StatusCode, nil
+  }
+
+  // ── Fetch SFTPGo groups (paginated) ───────────────────────────────────────
+
+  func fetchSFTPGoGroups(endpoint, apiKey string) (map[string]bool, error) {
+    all := make(map[string]bool)
+    limit := 500
+    offset := 0
+    for {
+      reqURL := fmt.Sprintf("%s/api/v2/groups?limit=%d&offset=%d", endpoint, limit, offset)
+      raw, status, err := sftpDo("GET", reqURL, apiKey, nil)
+      if err != nil {
+        return nil, fmt.Errorf("GET /api/v2/groups: %w", err)
+      }
+      if status >= 300 {
+        return nil, fmt.Errorf("GET /api/v2/groups HTTP %d: %s", status, strings.TrimSpace(string(raw)))
+      }
+      var groups []sftpGroup
+      if err := json.Unmarshal(raw, &groups); err != nil {
+        return nil, fmt.Errorf("decode groups: %w (body: %s)", err, string(raw))
+      }
+      log.Printf("  sftp groups page offset=%d: returned=%d", offset, len(groups))
+      for _, g := range groups {
+        if g.Name != "" {
+          all[g.Name] = true
+        }
+      }
+      if len(groups) < limit {
+        break
+      }
+      offset += limit
+    }
+    return all, nil
+  }
+
+  // ── Fetch SFTPGo users (paginated) — full objects as raw maps ─────────────
+  // Raw maps are used so PUT preserves all user fields (home_dir, permissions,
+  // filesystem config, etc.) and only the groups field is replaced.
+
+  func fetchSFTPGoUsers(endpoint, apiKey string) (map[string]map[string]interface{}, error) {
+    all := make(map[string]map[string]interface{})
+    limit := 500
+    offset := 0
+    for {
+      reqURL := fmt.Sprintf("%s/api/v2/users?limit=%d&offset=%d", endpoint, limit, offset)
+      raw, status, err := sftpDo("GET", reqURL, apiKey, nil)
+      if err != nil {
+        return nil, fmt.Errorf("GET /api/v2/users: %w", err)
+      }
+      if status >= 300 {
+        return nil, fmt.Errorf("GET /api/v2/users HTTP %d: %s", status, strings.TrimSpace(string(raw)))
+      }
+      var users []map[string]interface{}
+      if err := json.Unmarshal(raw, &users); err != nil {
+        return nil, fmt.Errorf("decode users: %w (body: %s)", err, string(raw))
+      }
+      log.Printf("  sftp users page offset=%d: returned=%d", offset, len(users))
+      for _, u := range users {
+        username, _ := u["username"].(string)
+        if username == "" {
+          continue
+        }
+        all[strings.ToLower(username)] = u
+      }
+      if len(users) < limit {
+        break
+      }
+      offset += limit
+    }
+    return all, nil
+  }
+
+  // ── SFTPGo group CRUD ──────────────────────────────────────────────────────
+
+  func createSFTPGoGroup(endpoint, apiKey, name string) error {
+    body, err := json.Marshal(map[string]interface{}{"name": name})
+    if err != nil {
+      return err
+    }
+    raw, status, err := sftpDo("POST", endpoint+"/api/v2/groups", apiKey, body)
+    if err != nil {
+      return err
+    }
+    log.Printf("    sftp create group %q HTTP %d: %s", name, status, strings.TrimSpace(string(raw)))
+    if status >= 300 {
+      return fmt.Errorf("POST /api/v2/groups HTTP %d: %s", status, strings.TrimSpace(string(raw)))
+    }
+    return nil
+  }
+
+  func deleteSFTPGoGroup(endpoint, apiKey, name string) error {
+    reqURL := fmt.Sprintf("%s/api/v2/groups/%s", endpoint, url.PathEscape(name))
+    raw, status, err := sftpDo("DELETE", reqURL, apiKey, nil)
+    if err != nil {
+      return err
+    }
+    log.Printf("    sftp delete group %q HTTP %d: %s", name, status, strings.TrimSpace(string(raw)))
+    if status >= 300 {
+      return fmt.Errorf("DELETE /api/v2/groups/%s HTTP %d: %s", name, status, strings.TrimSpace(string(raw)))
+    }
+    return nil
+  }
+
+  // ── SFTPGo user create ─────────────────────────────────────────────────────
+  // Creates a user with no password — authentication is handled by OIDC.
+  // The username is set to the lowercase email address to match OIDC claims.
+
+  func createSFTPGoUser(endpoint, apiKey, username, email string, groups []map[string]interface{}) error {
+    body, err := json.Marshal(map[string]interface{}{
+      "username":    username,
+      "email":       email,
+      "status":      1,
+      "groups":      groups,
+      "description": justIAMDescription,
+      "permissions": map[string]interface{}{
+        "/": []string{"*"},
+      },
+    })
+    if err != nil {
+      return err
+    }
+    raw, status, err := sftpDo("POST", endpoint+"/api/v2/users", apiKey, body)
+    if err != nil {
+      return err
+    }
+    log.Printf("    sftp create user %q HTTP %d: %s", username, status, strings.TrimSpace(string(raw)))
+    if status >= 300 {
+      return fmt.Errorf("POST /api/v2/users HTTP %d: %s", status, strings.TrimSpace(string(raw)))
+    }
+    return nil
+  }
+
+  // ── SFTPGo user group membership update ────────────────────────────────────
+  // Sends a full PUT preserving all existing user fields; only groups is replaced.
+
+  func updateSFTPGoUserGroups(endpoint, apiKey string, userObj map[string]interface{}, newGroups []map[string]interface{}) error {
+    username, _ := userObj["username"].(string)
+    updated := make(map[string]interface{}, len(userObj))
+    for k, v := range userObj {
+      updated[k] = v
+    }
+    updated["groups"] = newGroups
+    body, err := json.Marshal(updated)
+    if err != nil {
+      return err
+    }
+    reqURL := fmt.Sprintf("%s/api/v2/users/%s", endpoint, url.PathEscape(username))
+    raw, status, err := sftpDo("PUT", reqURL, apiKey, body)
+    if err != nil {
+      return err
+    }
+    log.Printf("    sftp update user %q HTTP %d: %s", username, status, strings.TrimSpace(string(raw)))
+    if status >= 300 {
+      return fmt.Errorf("PUT /api/v2/users/%s HTTP %d: %s", username, status, strings.TrimSpace(string(raw)))
+    }
+    return nil
+  }
+
+  // ── SFTPGo admin helpers ───────────────────────────────────────────────────
+
+  // fetchSFTPGoAdmins returns a map of lowercase username → description for all
+  // SFTPGo admin accounts. The description is used to identify JustIAM-managed
+  // admins (those with justIAMDescription) for deletion when no longer desired.
+  func fetchSFTPGoAdmins(endpoint, apiKey string) (map[string]string, error) {
+    all := make(map[string]string)
+    limit := 500
+    offset := 0
+    for {
+      reqURL := fmt.Sprintf("%s/api/v2/admins?limit=%d&offset=%d", endpoint, limit, offset)
+      raw, status, err := sftpDo("GET", reqURL, apiKey, nil)
+      if err != nil {
+        return nil, fmt.Errorf("GET /api/v2/admins: %w", err)
+      }
+      if status >= 300 {
+        return nil, fmt.Errorf("GET /api/v2/admins HTTP %d: %s", status, strings.TrimSpace(string(raw)))
+      }
+      var admins []sftpAdminEntry
+      if err := json.Unmarshal(raw, &admins); err != nil {
+        return nil, fmt.Errorf("decode admins: %w (body: %s)", err, string(raw))
+      }
+      log.Printf("  sftp admins page offset=%d: returned=%d", offset, len(admins))
+      for _, a := range admins {
+        if a.Username != "" {
+          all[strings.ToLower(a.Username)] = a.Description
+        }
+      }
+      if len(admins) < limit {
+        break
+      }
+      offset += limit
+    }
+    return all, nil
+  }
+
+  func deleteSFTPGoUser(endpoint, apiKey, username string) error {
+    reqURL := fmt.Sprintf("%s/api/v2/users/%s", endpoint, url.PathEscape(username))
+    raw, status, err := sftpDo("DELETE", reqURL, apiKey, nil)
+    if err != nil {
+      return err
+    }
+    log.Printf("    sftp delete user %q HTTP %d: %s", username, status, strings.TrimSpace(string(raw)))
+    if status >= 300 {
+      return fmt.Errorf("DELETE /api/v2/users/%s HTTP %d: %s", username, status, strings.TrimSpace(string(raw)))
+    }
+    return nil
+  }
+
+  func deleteSFTPGoAdmin(endpoint, apiKey, username string) error {
+    reqURL := fmt.Sprintf("%s/api/v2/admins/%s", endpoint, url.PathEscape(username))
+    raw, status, err := sftpDo("DELETE", reqURL, apiKey, nil)
+    if err != nil {
+      return err
+    }
+    log.Printf("    sftp delete admin %q HTTP %d: %s", username, status, strings.TrimSpace(string(raw)))
+    if status >= 300 {
+      return fmt.Errorf("DELETE /api/v2/admins/%s HTTP %d: %s", username, status, strings.TrimSpace(string(raw)))
+    }
+    return nil
+  }
+
+  // createSFTPGoAdmin provisions a new SFTPGo admin with a random one-time
+  // password. Admins are expected to authenticate via OIDC; the password is
+  // set so the account is valid but is not intended for direct use.
+  func createSFTPGoAdmin(endpoint, apiKey, username, email string) error {
+    password := fmt.Sprintf("Sync!%d%d", rand.Int63(), rand.Int63())
+    body, err := json.Marshal(map[string]interface{}{
+      "username":    username,
+      "email":       email,
+      "password":    password,
+      "status":      1,
+      "permissions": []string{"*"},
+      "description": justIAMDescription,
+    })
+    if err != nil {
+      return err
+    }
+    raw, status, err := sftpDo("POST", endpoint+"/api/v2/admins", apiKey, body)
+    if err != nil {
+      return err
+    }
+    log.Printf("    sftp create admin %q HTTP %d: %s", username, status, strings.TrimSpace(string(raw)))
+    if status >= 300 {
+      return fmt.Errorf("POST /api/v2/admins HTTP %d: %s", status, strings.TrimSpace(string(raw)))
+    }
+    return nil
+  }
+
+  // ── Helpers ────────────────────────────────────────────────────────────────
+
+  // getManagedGroupNames returns the subset of the user's current SFTPGo groups
+  // that are managed by this preset (i.e. present in allManagedGroups).
+  func getManagedGroupNames(userObj map[string]interface{}, allManagedGroups map[string]bool) map[string]bool {
+    result := make(map[string]bool)
+    groupsRaw, _ := userObj["groups"].([]interface{})
+    for _, g := range groupsRaw {
+      gmap, ok := g.(map[string]interface{})
+      if !ok {
+        continue
+      }
+      gname, _ := gmap["name"].(string)
+      if allManagedGroups[gname] {
+        result[gname] = true
+      }
+    }
+    return result
+  }
+
+  // buildNewGroups constructs the groups field for a PUT: retains non-managed
+  // groups unchanged and replaces managed ones with the desired set.
+  func buildNewGroups(userObj map[string]interface{}, allManagedGroups map[string]bool, desiredGroups map[string]bool) []map[string]interface{} {
+    var result []map[string]interface{}
+    groupsRaw, _ := userObj["groups"].([]interface{})
+    for _, g := range groupsRaw {
+      gmap, ok := g.(map[string]interface{})
+      if !ok {
+        continue
+      }
+      gname, _ := gmap["name"].(string)
+      if !allManagedGroups[gname] {
+        result = append(result, gmap)
+      }
+    }
+    for gname := range desiredGroups {
+      result = append(result, map[string]interface{}{"name": gname, "type": 2})
+    }
+    return result
+  }
+
+  func mapsEqual(a, b map[string]bool) bool {
+    if len(a) != len(b) {
+      return false
+    }
+    for k := range a {
+      if !b[k] {
+        return false
+      }
+    }
+    return true
+  }
+
+  func mapKeys(m map[string]bool) []string {
+    keys := make([]string, 0, len(m))
+    for k := range m {
+      keys = append(keys, k)
+    }
+    return keys
+  }
+
+  // ── Entry point ────────────────────────────────────────────────────────────
+
+  func Run() (string, error) {
+    endpoint     := strings.TrimRight(config.Get("sftpgo_endpoint"), "/")
+    appID        := config.Get("justiam_app_id")
+    varName      := config.Get("variable_name")
+    adminVarName := config.Get("admin_role_variable_name")
+    adminValue   := config.Get("admin_role_value")
+    apiKey       := secrets.Get("sftpgo_api_key")
+
+    var missing []string
+    if endpoint == "" { missing = append(missing, "config:sftpgo_endpoint") }
+    if appID == ""    { missing = append(missing, "config:justiam_app_id") }
+    if varName == ""  { missing = append(missing, "config:variable_name") }
+    if apiKey == ""   { missing = append(missing, "secret:sftpgo_api_key") }
+    if len(missing) > 0 {
+      return "", fmt.Errorf("missing required values: %s", strings.Join(missing, ", "))
+    }
+
+    adminSyncEnabled := adminVarName != "" && adminValue != ""
+    log.Printf("config: sftpgo_endpoint=%s justiam_app_id=%s variable_name=%s admin_sync=%v",
+      endpoint, appID, varName, adminSyncEnabled)
+
+    // 1. Build desired state from JustIAM.
+    // Scan all JustIAM groups; for each group that has an app mapping to the
+    // configured SFTPGo application (variable_name=varName), record the
+    // SFTPGo group name and collect the group's members.
+    allGroups, err := idp.ListAllGroups()
+    if err != nil {
+      return "", fmt.Errorf("list JustIAM groups: %w", err)
+    }
+    log.Printf("justiam: %d groups found", len(allGroups))
+
+    // desiredGroups: SFTPGo group name → true
+    desiredGroups := make(map[string]bool)
+    // desiredUserGroups: lowercase email → set of SFTPGo group names the user should be in
+    desiredUserGroups := make(map[string]map[string]bool)
+    // desiredAdmins: lowercase email → true (users to create as SFTPGo admins)
+    desiredAdmins := make(map[string]bool)
+
+    for _, g := range allGroups {
+      mappings, err := idp.GetGroupMappings(g.ID)
+      if err != nil {
+        log.Printf("WARNING: get mappings for group %q (id=%s): %v — skipping", g.Name, g.ID, err)
+        continue
+      }
+      var sftpGroupNames []string
+      isAdminGroup := false
+      for _, m := range mappings {
+        if m.ApplicationID != appID {
+          continue
+        }
+        if m.VariableName == varName {
+          sftpGroupNames = append(sftpGroupNames, m.Value)
+          desiredGroups[m.Value] = true
+        }
+        if adminSyncEnabled && m.VariableName == adminVarName && m.Value == adminValue {
+          isAdminGroup = true
+        }
+      }
+      if len(sftpGroupNames) == 0 && !isAdminGroup {
+        continue
+      }
+      members, err := idp.GetGroupMembers(g.ID)
+      if err != nil {
+        log.Printf("WARNING: get members of group %q (id=%s): %v — skipping", g.Name, g.ID, err)
+        continue
+      }
+      log.Printf("justiam group %q → sftp groups %v admin=%v, %d members", g.Name, sftpGroupNames, isAdminGroup, len(members))
+      for _, u := range members {
+        if u.Email == "" {
+          continue
+        }
+        if u.IsServiceAccount {
+          log.Printf("  skipping service account %q", u.Email)
+          continue
+        }
+        emailKey := strings.ToLower(u.Email)
+        if isAdminGroup {
+          desiredAdmins[emailKey] = true
+        }
+        if _, ok := desiredUserGroups[emailKey]; !ok {
+          desiredUserGroups[emailKey] = make(map[string]bool)
+        }
+        for _, sg := range sftpGroupNames {
+          desiredUserGroups[emailKey][sg] = true
+        }
+      }
+    }
+
+    // Admin users are provisioned as SFTPGo admins only — remove them from the
+    // regular user set so they are not also created as regular SFTPGo users.
+    for email := range desiredAdmins {
+      delete(desiredUserGroups, email)
+    }
+
+    log.Printf("desired state: %d sftp groups, %d users with group assignments",
+      len(desiredGroups), len(desiredUserGroups))
+    if len(desiredGroups) == 0 {
+      return "", fmt.Errorf("no SFTPGo groups found in JustIAM — check that justiam_app_id and variable_name are correct and groups have mappings assigned")
+    }
+
+    // 2. Fetch current SFTPGo groups.
+    log.Printf("fetching SFTPGo groups from %s ...", endpoint)
+    currentGroups, err := fetchSFTPGoGroups(endpoint, apiKey)
+    if err != nil {
+      return "", fmt.Errorf("fetch sftp groups: %w", err)
+    }
+    log.Printf("sftpgo: %d groups found", len(currentGroups))
+    groupsBefore := len(currentGroups)
+
+    // 3. Create SFTPGo groups present in JustIAM but missing in SFTPGo.
+    var groupsCreated []string
+    for name := range desiredGroups {
+      if !currentGroups[name] {
+        log.Printf("creating SFTPGo group %q ...", name)
+        if err := createSFTPGoGroup(endpoint, apiKey, name); err != nil {
+          return "", fmt.Errorf("create sftp group %q: %w", name, err)
+        }
+        groupsCreated = append(groupsCreated, name)
+      } else {
+        log.Printf("SFTPGo group %q already exists — skipping", name)
+      }
+    }
+
+    // 4. Delete SFTPGo groups no longer in JustIAM.
+    var groupsDeleted []string
+    for name := range currentGroups {
+      if !desiredGroups[name] {
+        log.Printf("deleting stale SFTPGo group %q ...", name)
+        if err := deleteSFTPGoGroup(endpoint, apiKey, name); err != nil {
+          return "", fmt.Errorf("delete sftp group %q: %w", name, err)
+        }
+        groupsDeleted = append(groupsDeleted, name)
+      }
+    }
+
+    // 5. Fetch current SFTPGo users (full objects for safe PUT later).
+    log.Printf("fetching SFTPGo users from %s ...", endpoint)
+    currentUsers, err := fetchSFTPGoUsers(endpoint, apiKey)
+    if err != nil {
+      return "", fmt.Errorf("fetch sftp users: %w", err)
+    }
+    log.Printf("sftpgo: %d users found", len(currentUsers))
+    usersBefore := len(currentUsers)
+
+    // 6a. Delete JustIAM-managed users (marked with justIAMDescription) that are
+    // no longer present in the desired state.
+    var toDeleteUsers []string
+    for username, userObj := range currentUsers {
+      desc, _ := userObj["description"].(string)
+      if desc == justIAMDescription {
+        if _, inDesired := desiredUserGroups[username]; !inDesired {
+          toDeleteUsers = append(toDeleteUsers, username)
+        }
+      }
+    }
+    var usersDeleted []string
+    for _, username := range toDeleteUsers {
+      log.Printf("deleting stale SFTPGo user %q (no longer in JustIAM) ...", username)
+      if err := deleteSFTPGoUser(endpoint, apiKey, username); err != nil {
+        return "", fmt.Errorf("delete sftp user %q: %w", username, err)
+      }
+      usersDeleted = append(usersDeleted, username)
+      delete(currentUsers, username)
+    }
+
+    // 6b. Create SFTPGo users for JustIAM members that have no account yet.
+    // Users are created with no password; OIDC handles authentication.
+    var usersCreated []string
+    for email, groupSet := range desiredUserGroups {
+      if _, exists := currentUsers[email]; !exists {
+        log.Printf("creating SFTPGo user %q ...", email)
+        var initGroups []map[string]interface{}
+        for gname := range groupSet {
+          initGroups = append(initGroups, map[string]interface{}{"name": gname, "type": 2})
+        }
+        if err := createSFTPGoUser(endpoint, apiKey, email, email, initGroups); err != nil {
+          return "", fmt.Errorf("create sftp user %q: %w", email, err)
+        }
+        usersCreated = append(usersCreated, email)
+      }
+    }
+
+    // Re-fetch users so newly created/deleted ones are reflected for membership sync.
+    if len(usersCreated) > 0 || len(usersDeleted) > 0 {
+      log.Printf("re-fetching SFTPGo users after creation ...")
+      currentUsers, err = fetchSFTPGoUsers(endpoint, apiKey)
+      if err != nil {
+        return "", fmt.Errorf("re-fetch sftp users: %w", err)
+      }
+    }
+
+    // 7. Sync group membership — full reconciliation.
+    // Process every user that either (a) should be in managed groups, or
+    // (b) currently has managed groups in SFTPGo (to handle removal).
+    usersToProcess := make(map[string]bool)
+    for email := range desiredUserGroups {
+      usersToProcess[email] = true
+    }
+    for email, userObj := range currentUsers {
+      groupsRaw, _ := userObj["groups"].([]interface{})
+      for _, g := range groupsRaw {
+        gmap, ok := g.(map[string]interface{})
+        if !ok {
+          continue
+        }
+        gname, _ := gmap["name"].(string)
+        if desiredGroups[gname] {
+          usersToProcess[email] = true
+          break
+        }
+      }
+    }
+
+    var membershipUpdated []string
+    membershipSkipped := 0
+
+    for email := range usersToProcess {
+      if desiredAdmins[email] {
+        log.Printf("user %q is an SFTPGo admin — skipping regular user membership sync", email)
+        membershipSkipped++
+        continue
+      }
+      userObj, exists := currentUsers[email]
+      if !exists {
+        log.Printf("WARNING: user %q not in SFTPGo for membership sync — skipping", email)
+        continue
+      }
+      desired := desiredUserGroups[email] // nil if removed from all groups
+      currentManaged := getManagedGroupNames(userObj, desiredGroups)
+      if mapsEqual(currentManaged, desired) {
+        log.Printf("user %q managed groups in sync %v — skipping", email, mapKeys(currentManaged))
+        membershipSkipped++
+        continue
+      }
+      log.Printf("updating user %q managed groups: %v → %v",
+        email, mapKeys(currentManaged), mapKeys(desired))
+      newGroups := buildNewGroups(userObj, desiredGroups, desired)
+      if err := updateSFTPGoUserGroups(endpoint, apiKey, userObj, newGroups); err != nil {
+        return "", fmt.Errorf("update groups for user %q: %w", email, err)
+      }
+      membershipUpdated = append(membershipUpdated, email)
+    }
+
+    // 8. Sync SFTPGo admin accounts (only when admin sync is enabled).
+    var adminsCreated, adminsDeleted []string
+    if adminSyncEnabled {
+      log.Printf("fetching SFTPGo admins from %s ...", endpoint)
+      currentAdmins, err := fetchSFTPGoAdmins(endpoint, apiKey)
+      if err != nil {
+        return "", fmt.Errorf("fetch sftp admins: %w", err)
+      }
+      log.Printf("sftpgo: %d admins found", len(currentAdmins))
+
+      // Delete JustIAM-managed admins that are no longer desired.
+      for username, desc := range currentAdmins {
+        if desc != justIAMDescription {
+          continue
+        }
+        if desiredAdmins[username] {
+          continue
+        }
+        log.Printf("deleting stale SFTPGo admin %q (no longer in JustIAM) ...", username)
+        if err := deleteSFTPGoAdmin(endpoint, apiKey, username); err != nil {
+          return "", fmt.Errorf("delete sftp admin %q: %w", username, err)
+        }
+        adminsDeleted = append(adminsDeleted, username)
+      }
+
+      // Create admins that are desired but not yet in SFTPGo.
+      for email := range desiredAdmins {
+        if _, exists := currentAdmins[email]; exists {
+          log.Printf("SFTPGo admin %q already exists — skipping", email)
+          continue
+        }
+        log.Printf("creating SFTPGo admin %q ...", email)
+        if err := createSFTPGoAdmin(endpoint, apiKey, email, email); err != nil {
+          return "", fmt.Errorf("create sftp admin %q: %w", email, err)
+        }
+        adminsCreated = append(adminsCreated, email)
+      }
+    }
+
+    return fmt.Sprintf(
+      "sync complete: groups[desired=%d before=%d created=%d %v deleted=%d %v] users[before=%d created=%d %v deleted=%d %v] admins[desired=%d created=%d %v deleted=%d %v] membership[updated=%d skipped=%d]",
+      len(desiredGroups), groupsBefore,
+      len(groupsCreated), groupsCreated,
+      len(groupsDeleted), groupsDeleted,
+      usersBefore, len(usersCreated), usersCreated, len(usersDeleted), usersDeleted,
+      len(desiredAdmins), len(adminsCreated), adminsCreated, len(adminsDeleted), adminsDeleted,
+      len(membershipUpdated), membershipSkipped,
+    ), nil
+  }
