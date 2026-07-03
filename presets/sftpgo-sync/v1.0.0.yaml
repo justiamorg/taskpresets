@@ -541,23 +541,21 @@ script: |
       }
     }
 
-    // 4. Delete JustIAM-managed SFTPGo groups no longer in desired state.
-    var groupsDeleted []string
+    // allJustIAMManagedGroupNames is the union of groups that already carry the
+    // JustIAM marker in SFTPGo and groups that are currently desired. This wider
+    // set is used during membership sync so that stale group memberships are
+    // stripped from users before the now-empty groups are deleted in step 8.
+    allJustIAMManagedGroupNames := make(map[string]bool)
     for name, desc := range currentGroups {
-      if desc != justIAMDescription {
-        log.Printf("SFTPGo group %q not managed by JustIAM — skipping deletion", name)
-        continue
-      }
-      if !desiredGroups[name] {
-        log.Printf("deleting stale SFTPGo group %q ...", name)
-        if err := deleteSFTPGoGroup(endpoint, apiKey, name); err != nil {
-          return "", fmt.Errorf("delete sftp group %q: %w", name, err)
-        }
-        groupsDeleted = append(groupsDeleted, name)
+      if desc == justIAMDescription {
+        allJustIAMManagedGroupNames[name] = true
       }
     }
+    for name := range desiredGroups {
+      allJustIAMManagedGroupNames[name] = true
+    }
 
-    // 5. Fetch current SFTPGo users (full objects for safe PUT later).
+    // 4. Fetch current SFTPGo users (full objects for safe PUT later).
     log.Printf("fetching SFTPGo users from %s ...", endpoint)
     currentUsers, err := fetchSFTPGoUsers(endpoint, apiKey)
     if err != nil {
@@ -566,7 +564,7 @@ script: |
     log.Printf("sftpgo: %d users found", len(currentUsers))
     usersBefore := len(currentUsers)
 
-    // 6a. Delete JustIAM-managed users (marked with justIAMDescription) that are
+    // 5a. Delete JustIAM-managed users (marked with justIAMDescription) that are
     // no longer present in the desired state.
     var toDeleteUsers []string
     for username, userObj := range currentUsers {
@@ -587,7 +585,7 @@ script: |
       delete(currentUsers, username)
     }
 
-    // 6b. Create SFTPGo users for JustIAM members that have no account yet.
+    // 5b. Create SFTPGo users for JustIAM members that have no account yet.
     // Users are created with no password; OIDC handles authentication.
     var usersCreated []string
     for email, groupSet := range desiredUserGroups {
@@ -613,9 +611,11 @@ script: |
       }
     }
 
-    // 7. Sync group membership — full reconciliation.
+    // 6. Sync group membership — full reconciliation.
     // Process every user that either (a) should be in managed groups, or
-    // (b) currently has managed groups in SFTPGo (to handle removal).
+    // (b) currently has any JustIAM-managed group (including stale ones being
+    // removed). Using allJustIAMManagedGroupNames ensures stale group memberships
+    // are stripped from users before those groups are deleted in step 7.
     usersToProcess := make(map[string]bool)
     for email := range desiredUserGroups {
       usersToProcess[email] = true
@@ -628,7 +628,7 @@ script: |
           continue
         }
         gname, _ := gmap["name"].(string)
-        if desiredGroups[gname] {
+        if allJustIAMManagedGroupNames[gname] {
           usersToProcess[email] = true
           break
         }
@@ -645,7 +645,7 @@ script: |
         continue
       }
       desired := desiredUserGroups[email] // nil if removed from all groups
-      currentManaged := getManagedGroupNames(userObj, desiredGroups)
+      currentManaged := getManagedGroupNames(userObj, allJustIAMManagedGroupNames)
       if mapsEqual(currentManaged, desired) {
         log.Printf("user %q managed groups in sync %v — skipping", email, mapKeys(currentManaged))
         membershipSkipped++
@@ -653,11 +653,29 @@ script: |
       }
       log.Printf("updating user %q managed groups: %v → %v",
         email, mapKeys(currentManaged), mapKeys(desired))
-      newGroups := buildNewGroups(userObj, desiredGroups, desired)
+      newGroups := buildNewGroups(userObj, allJustIAMManagedGroupNames, desired)
       if err := updateSFTPGoUserGroups(endpoint, apiKey, userObj, newGroups); err != nil {
         return "", fmt.Errorf("update groups for user %q: %w", email, err)
       }
       membershipUpdated = append(membershipUpdated, email)
+    }
+
+    // 7. Delete JustIAM-managed SFTPGo groups no longer in desired state.
+    // This runs after user deletion (5a) and membership sync (6) so that all
+    // group references have been removed before the delete is attempted.
+    var groupsDeleted []string
+    for name, desc := range currentGroups {
+      if desc != justIAMDescription {
+        log.Printf("SFTPGo group %q not managed by JustIAM — skipping deletion", name)
+        continue
+      }
+      if !desiredGroups[name] {
+        log.Printf("deleting stale SFTPGo group %q ...", name)
+        if err := deleteSFTPGoGroup(endpoint, apiKey, name); err != nil {
+          return "", fmt.Errorf("delete sftp group %q: %w", name, err)
+        }
+        groupsDeleted = append(groupsDeleted, name)
+      }
     }
 
     // 8. Sync SFTPGo admin accounts (only when admin sync is enabled).
