@@ -511,9 +511,6 @@ script: |
 
     log.Printf("desired state: %d sftp groups, %d users with group assignments, %d admins",
       len(desiredGroups), len(desiredUserGroups), len(desiredAdmins))
-    if len(desiredGroups) == 0 {
-      return "", fmt.Errorf("no SFTPGo groups found in JustIAM — check that justiam_app_id and variable_name are correct and groups have mappings assigned")
-    }
 
     // 2. Fetch current SFTPGo groups.
     log.Printf("fetching SFTPGo groups from %s ...", endpoint)
