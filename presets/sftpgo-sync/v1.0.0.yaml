@@ -509,14 +509,8 @@ script: |
       }
     }
 
-    // Admin users are provisioned as SFTPGo admins only — remove them from the
-    // regular user set so they are not also created as regular SFTPGo users.
-    for email := range desiredAdmins {
-      delete(desiredUserGroups, email)
-    }
-
-    log.Printf("desired state: %d sftp groups, %d users with group assignments",
-      len(desiredGroups), len(desiredUserGroups))
+    log.Printf("desired state: %d sftp groups, %d users with group assignments, %d admins",
+      len(desiredGroups), len(desiredUserGroups), len(desiredAdmins))
     if len(desiredGroups) == 0 {
       return "", fmt.Errorf("no SFTPGo groups found in JustIAM — check that justiam_app_id and variable_name are correct and groups have mappings assigned")
     }
@@ -638,11 +632,6 @@ script: |
     membershipSkipped := 0
 
     for email := range usersToProcess {
-      if desiredAdmins[email] {
-        log.Printf("user %q is an SFTPGo admin — skipping regular user membership sync", email)
-        membershipSkipped++
-        continue
-      }
       userObj, exists := currentUsers[email]
       if !exists {
         log.Printf("WARNING: user %q not in SFTPGo for membership sync — skipping", email)
