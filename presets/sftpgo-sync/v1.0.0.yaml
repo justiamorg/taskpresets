@@ -80,7 +80,8 @@ script: |
   const justIAMDescription = "Created with JustIAM Automation"
 
   type sftpGroup struct {
-    Name string `json:"name"`
+    Name        string `json:"name"`
+    Description string `json:"description"`
   }
 
   type sftpAdminEntry struct {
@@ -115,8 +116,10 @@ script: |
 
   // ── Fetch SFTPGo groups (paginated) ───────────────────────────────────────
 
-  func fetchSFTPGoGroups(endpoint, apiKey string) (map[string]bool, error) {
-    all := make(map[string]bool)
+  // fetchSFTPGoGroups returns a map of group name → description. The description
+  // is used to identify JustIAM-managed groups for marker-based deletion.
+  func fetchSFTPGoGroups(endpoint, apiKey string) (map[string]string, error) {
+    all := make(map[string]string)
     limit := 500
     offset := 0
     for {
@@ -135,7 +138,7 @@ script: |
       log.Printf("  sftp groups page offset=%d: returned=%d", offset, len(groups))
       for _, g := range groups {
         if g.Name != "" {
-          all[g.Name] = true
+          all[g.Name] = g.Description
         }
       }
       if len(groups) < limit {
@@ -186,7 +189,10 @@ script: |
   // ── SFTPGo group CRUD ──────────────────────────────────────────────────────
 
   func createSFTPGoGroup(endpoint, apiKey, name string) error {
-    body, err := json.Marshal(map[string]interface{}{"name": name})
+    body, err := json.Marshal(map[string]interface{}{
+      "name":        name,
+      "description": justIAMDescription,
+    })
     if err != nil {
       return err
     }
@@ -524,7 +530,7 @@ script: |
     // 3. Create SFTPGo groups present in JustIAM but missing in SFTPGo.
     var groupsCreated []string
     for name := range desiredGroups {
-      if !currentGroups[name] {
+      if _, exists := currentGroups[name]; !exists {
         log.Printf("creating SFTPGo group %q ...", name)
         if err := createSFTPGoGroup(endpoint, apiKey, name); err != nil {
           return "", fmt.Errorf("create sftp group %q: %w", name, err)
@@ -535,9 +541,13 @@ script: |
       }
     }
 
-    // 4. Delete SFTPGo groups no longer in JustIAM.
+    // 4. Delete JustIAM-managed SFTPGo groups no longer in desired state.
     var groupsDeleted []string
-    for name := range currentGroups {
+    for name, desc := range currentGroups {
+      if desc != justIAMDescription {
+        log.Printf("SFTPGo group %q not managed by JustIAM — skipping deletion", name)
+        continue
+      }
       if !desiredGroups[name] {
         log.Printf("deleting stale SFTPGo group %q ...", name)
         if err := deleteSFTPGoGroup(endpoint, apiKey, name); err != nil {
