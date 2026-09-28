@@ -50,16 +50,14 @@ script: |
   package task
 
   import (
-    "bytes"
     "encoding/json"
     "errors"
     "fmt"
-    "io"
     "log"
-    "net/http"
     "strings"
 
     "config"
+    "fetch"
     "idp"
     "secrets"
   )
@@ -144,27 +142,19 @@ script: |
   // ── Datadog HTTP helper ────────────────────────────────────────────────────
 
   func ddDo(method, url, apiKey, appKey string, body []byte) ([]byte, int, error) {
-    var br io.Reader
-    if len(body) > 0 {
-      br = bytes.NewReader(body)
+    headers := map[string]string{
+      "DD-API-KEY":         apiKey,
+      "DD-APPLICATION-KEY": appKey,
+      "Accept":             "application/json",
     }
-    req, err := http.NewRequest(method, url, br)
+    if len(body) > 0 {
+      headers["Content-Type"] = "application/json"
+    }
+    resp, err := fetch.Do(method, url, string(body), headers)
     if err != nil {
       return nil, 0, err
     }
-    req.Header.Set("DD-API-KEY", apiKey)
-    req.Header.Set("DD-APPLICATION-KEY", appKey)
-    req.Header.Set("Accept", "application/json")
-    if len(body) > 0 {
-      req.Header.Set("Content-Type", "application/json")
-    }
-    resp, err := http.DefaultClient.Do(req)
-    if err != nil {
-      return nil, 0, err
-    }
-    raw, _ := io.ReadAll(resp.Body)
-    resp.Body.Close()
-    return raw, resp.StatusCode, nil
+    return []byte(resp.Body), resp.StatusCode, nil
   }
 
   // ── Datadog: fetch all teams (paginated) ───────────────────────────────────

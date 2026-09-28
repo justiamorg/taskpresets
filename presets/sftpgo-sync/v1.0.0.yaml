@@ -60,17 +60,15 @@ script: |
   package task
 
   import (
-    "bytes"
     "encoding/json"
     "fmt"
-    "io"
     "log"
     "math/rand"
-    "net/http"
     "net/url"
     "strings"
 
     "config"
+    "fetch"
     "idp"
     "secrets"
   )
@@ -92,26 +90,18 @@ script: |
   // ── SFTPGo HTTP helper ─────────────────────────────────────────────────────
 
   func sftpDo(method, reqURL, apiKey string, body []byte) ([]byte, int, error) {
-    var br io.Reader
-    if len(body) > 0 {
-      br = bytes.NewReader(body)
+    headers := map[string]string{
+      "X-SFTPGO-API-KEY": apiKey,
+      "Accept":           "application/json",
     }
-    req, err := http.NewRequest(method, reqURL, br)
+    if len(body) > 0 {
+      headers["Content-Type"] = "application/json"
+    }
+    resp, err := fetch.Do(method, reqURL, string(body), headers)
     if err != nil {
       return nil, 0, err
     }
-    req.Header.Set("X-SFTPGO-API-KEY", apiKey)
-    req.Header.Set("Accept", "application/json")
-    if len(body) > 0 {
-      req.Header.Set("Content-Type", "application/json")
-    }
-    resp, err := http.DefaultClient.Do(req)
-    if err != nil {
-      return nil, 0, err
-    }
-    raw, _ := io.ReadAll(resp.Body)
-    resp.Body.Close()
-    return raw, resp.StatusCode, nil
+    return []byte(resp.Body), resp.StatusCode, nil
   }
 
   // ── Fetch SFTPGo groups (paginated) ───────────────────────────────────────
